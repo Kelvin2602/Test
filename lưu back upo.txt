@@ -1,0 +1,506 @@
+import asyncio
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, date, time
+import pytz
+import logging
+from logging.handlers import RotatingFileHandler
+import coloredlogs
+import sqlite3
+import hashlib
+import os
+import configparser
+from tabulate import tabulate
+import emoji
+import json
+from telegram.error import Forbidden, BadRequest
+import io
+import sys
+import codecs
+
+# Cấu hình để xử lý Unicode trên Windows
+sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
+# Cấu hình logging
+logger = logging.getLogger(__name__)
+coloredlogs.install(level='DEBUG', logger=logger,
+                    fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Thêm file handler để lưu log vào file với encoding UTF-8
+file_handler = RotatingFileHandler('bot.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+# Cấu hình múi giờ
+VN_TIMEZONE = pytz.timezone('Asia/Ho_Chi_Minh')
+
+# Đọc config
+config = configparser.ConfigParser()
+config.read('config.ini', encoding='utf-8')
+
+# Đọc token bot
+BOT_TOKEN = config['telegram']['YOUR_BOT_TOKEN']
+
+# Đọc admin_id
+ADMIN_ID = [int(id.strip()) for id in config['telegram']['admin_id'].split(',')]
+MAIN_ADMIN_ID = ADMIN_ID[0]
+
+# Đọc authorized_users và allowed_actions
+AUTHORIZED_USERS = [int(user_id) for user_id in config['group_action_permissions']['authorized_users'].split(',')]
+ALLOWED_ACTIONS = config['group_action_permissions']['allowed_actions'].split(',')
+
+# Đọc thời gian làm việc
+WORK_START_TIME = datetime.strptime(config['working_hours']['start_time'], '%H:%M').time()
+WORK_END_TIME = datetime.strptime(config['working_hours']['end_time'], '%H:%M').time()
+
+# Đọc thời gian nghỉ
+BREAK_DURATIONS = {
+    '🚻 Vệ sinh (厕所)': int(config['break_durations']['ve_sinh']),
+    '🚬 Hút thuốc (抽烟)': int(config['break_durations']['hut_thuoc']),
+    '🍚 Ăn cơm (吃饭)': int(config['break_durations']['an_com'])
+}
+
+# Đọc tần suất nghỉ
+BREAK_FREQUENCIES = {
+    '🚻 Vệ sinh (厕所)': int(config['break_frequencies']['ve_sinh']),
+    '🚬 Hút thuốc (抽烟)': int(config['break_frequencies']['hut_thuoc']),
+    '🍚 Ăn cơm (吃饭)': int(config['break_frequencies']['an_com'])
+}
+
+# Đọc URL database
+DATABASE_URL = config['database']['url']
+
+@dataclass
+class UserState:
+    user_name: str
+    start_time: datetime = None
+    end_time: datetime = None
+    current_break: str = None
+    break_start_time: datetime = None
+    breaks: dict = field(default_factory=lambda: {k: timedelta(0) for k in BREAK_DURATIONS.keys()})
+    is_working: bool = False
+    break_counts: dict = field(default_factory=lambda: {k: 0 for k in BREAK_DURATIONS.keys()})
+
+user_states = {}
+
+def hash_user_id(user_id: int) -> str:
+    salt = os.environ.get('USER_ID_SALT', 'default_salt')
+    return hashlib.sha256(f"{user_id}{salt}".encode()).hexdigest()
+
+def get_keyboard():
+    buttons = [
+        [KeyboardButton("🚀 Lên ca (上班)"), KeyboardButton("🏁 Xuống ca (下班)")],
+        [KeyboardButton("🍚 Ăn cơm (吃饭)"), KeyboardButton("🚬 Hút thuốc (抽烟)")],
+        [KeyboardButton("💺 Trở lại chỗ ngồi (返回)"), KeyboardButton("🚻 Vệ sinh (厕所)")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def get_admin_keyboard():
+    buttons = [
+        [InlineKeyboardButton("🚀 Lên ca tất cả", callback_data="all_start_shift"),
+         InlineKeyboardButton("🏁 Xuống ca tất cả", callback_data="all_end_shift")],
+        [InlineKeyboardButton("🍚 Giờ ăn tất cả", callback_data="all_eat"),
+         InlineKeyboardButton("🔄 Reset dữ liệu", callback_data="reset_data")]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+# Thay đổi biến global
+active_users = set(ADMIN_ID)  # Khởi tạo với tất cả admin
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
+    
+    if chat_type == 'private':
+        if user_id == MAIN_ADMIN_ID:
+            await update.message.reply_text("Chào mừng, Admin chính! Bạn có quyền điều khiển đầy đủ.", reply_markup=get_keyboard())
+        elif user_id in ADMIN_ID:
+            await update.message.reply_text("Chào mừng, Admin! Bạn sẽ nhận được các báo cáo hàng ngày.", reply_markup=get_keyboard())
+        else:
+            active_users.add(user_id)
+            await update.message.reply_text("Chào mừng! Vui lòng chọn một hành động:", reply_markup=get_keyboard())
+    else:  # Trong nhóm
+        await update.message.reply_text("Chào mừng! Vui lòng chọn một hành động:", reply_markup=get_keyboard())
+
+    # Gửi thông báo cho tất cả admin khác nếu người dùng là admin
+    if user_id in ADMIN_ID:
+        for admin_id in ADMIN_ID:
+            if admin_id != user_id:
+                try:
+                    await context.bot.send_message(chat_id=admin_id, text="Bot đã được kích hoạt bởi một admin. Bạn có thể nhận thông báo ngay bây giờ.")
+                except (Forbidden, BadRequest) as e:
+                    logger.warning(f"Không thể gửi tin nhắn cho admin {admin_id}. Lỗi: {str(e)}")
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "all_start_shift":
+        await all_start_shift(update, context)
+    elif query.data == "all_end_shift":
+        await all_end_shift(update, context)
+    elif query.data == "all_eat":
+        await all_eat(update, context)
+    elif query.data == "reset_data":
+        await reset_data(update, context)
+
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str, notify_all=False):
+    admin_list = ADMIN_ID if notify_all else [MAIN_ADMIN_ID]
+    for admin_id in admin_list:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=emoji.emojize(message))
+        except (Forbidden, BadRequest) as e:
+            logger.warning(f"Không thể gửi tin nhắn cho admin {admin_id}. Lỗi: {str(e)}")
+
+def check_break_frequency(user_state: UserState, break_type: str) -> bool:
+    return user_state.break_counts[break_type] > BREAK_FREQUENCIES[break_type]
+
+async def handle_break_start(update: Update, context: ContextTypes.DEFAULT_TYPE, user_state: UserState, break_type: str) -> str:
+    if not user_state.is_working:
+        return "Bạn chưa bắt đầu ca làm việc. Vui lòng lên ca trước khi bắt đầu giờ nghỉ."
+    
+    if user_state.current_break:
+        return f"Bạn đang trong giờ nghỉ {user_state.current_break}. Vui lòng kết thúc giờ nghỉ hiện tại trước."
+    
+    now = datetime.now(VN_TIMEZONE)
+    user_state.current_break = break_type
+    user_state.break_start_time = now
+    user_state.break_counts[break_type] += 1
+    
+    response = f"⏳ Bắt đầu {break_type} lúc {now.strftime('%H:%M:%S')}. Thời gian tối đa: {BREAK_DURATIONS[break_type]} phút."
+    
+    if check_break_frequency(user_state, break_type):
+        await notify_admin(context, f"⚠️ {user_state.user_name} đã bắt đầu {break_type} lần thứ {user_state.break_counts[break_type]}, vượt quá số lần quy định ({BREAK_FREQUENCIES[break_type]}).")
+    
+    return response
+
+async def handle_break_end(update: Update, context: ContextTypes.DEFAULT_TYPE, user_state: UserState) -> str:
+    if not user_state.current_break:
+        return "Bạn không trong giờ nghỉ. Không thể kết thúc giờ nghỉ."
+    
+    now = datetime.now(VN_TIMEZONE)
+    break_duration = now - user_state.break_start_time
+    user_state.breaks[user_state.current_break] += break_duration
+    
+    response = f"⌛ Kết thúc {user_state.current_break} sau {now.strftime('%H:%M:%S')}.\n"
+    
+    if break_duration > timedelta(minutes=BREAK_DURATIONS[user_state.current_break]):
+        overtime = break_duration - timedelta(minutes=BREAK_DURATIONS[user_state.current_break])
+        response += f"⚠️ Bạn đã nghỉ quá {str(overtime).split('.')[0]} so với quy định."
+        
+        await notify_admin(context, f"⚠️ {user_state.user_name} đã kết thúc {user_state.current_break} sau {str(break_duration).split('.')[0]}, vượt quá {str(overtime).split('.')[0]} so với quy định.")
+    
+    # Thêm thông tin về thời gian và số lần nghỉ
+    response += f"\nThời gian nghỉ: {str(break_duration).split('.')[0]} phút."
+    response += f"\nSố lần nghỉ {user_state.current_break}: {user_state.break_counts[user_state.current_break]} lần."
+    
+    user_state.current_break = None
+    user_state.break_start_time = None
+    
+    return response
+
+async def handle_start_shift(update: Update, context: ContextTypes.DEFAULT_TYPE, user_state: UserState) -> str:
+    if user_state.is_working:
+        return "Bạn đã lên ca rồi. Không thể lên ca lại."
+    
+    now = datetime.now(VN_TIMEZONE)
+    user_state.start_time = now
+    user_state.is_working = True
+    
+    response = f"✅ {user_state.user_name} đã lên ca lúc {now.strftime('%H:%M:%S')}"
+    
+    is_late = now.time() > WORK_START_TIME
+    if is_late:
+        late_minutes = (now - now.replace(hour=WORK_START_TIME.hour, minute=WORK_START_TIME.minute, second=0, microsecond=0)).total_seconds() // 60
+        response += f"\n⚠️ Bạn đã đi làm muộn {late_minutes:.0f} phút."
+        await notify_admin(context, f"⚠️ {user_state.user_name} đã đi làm muộn {late_minutes:.0f} phút. Lên ca lúc {now.strftime('%H:%M:%S')}.")
+    
+    return response
+
+async def handle_end_shift(update: Update, context: ContextTypes.DEFAULT_TYPE, user_state: UserState) -> str:
+    if not user_state.is_working:
+        return "Bạn chưa lên ca. Không thể xuống ca."
+    
+    now = datetime.now(VN_TIMEZONE)
+    user_state.end_time = now
+    user_state.is_working = False
+    
+    if user_state.current_break:
+        user_state.breaks[user_state.current_break] += now - user_state.break_start_time
+        user_state.current_break = None
+        user_state.break_start_time = None
+    
+    total_work_time = now - user_state.start_time
+    total_break_time = sum(user_state.breaks.values(), timedelta())
+    actual_work_time = total_work_time - total_break_time
+    
+    response = f"📅 Báo cáo ngày {now.strftime('%d/%m/%Y')}:\n\n"
+    response += f"👤 Người dùng: {user_state.user_name}\n"
+    response += f"🆔 User ID: {hash_user_id(update.effective_user.id)[:7]}\n"
+    response += "------------------------\n"
+    response += f"✅ Xuống ca - {now.strftime('%d/%m/%Y %H:%M:%S')}\n"
+    response += "------------------------\n"
+    response += f"⏰ Thời gian làm việc: {str(total_work_time).split('.')[0]}\n"
+    response += f"⚙️ Thời gian làm việc thực tế: {str(actual_work_time).split('.')[0]}\n"
+    response += "------------------------\n"
+    response += f"📊 Tổng thời gian nghỉ: {str(total_break_time).split('.')[0]}\n"
+    for break_type, duration in user_state.breaks.items():
+        response += f"{break_type}: {str(duration).split('.')[0]} ({user_state.break_counts[break_type]} lần)\n"
+    response += "------------------------\n"
+    response += f"✅ {user_state.user_name} đã xuống ca."
+    
+    return response
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    hashed_user_id = hash_user_id(user_id)
+    message_text = update.message.text
+    
+    if hashed_user_id not in user_states:
+        user_states[hashed_user_id] = UserState(user_name=update.effective_user.full_name)
+    
+    user_state = user_states[hashed_user_id]
+    
+    if message_text == "🚀 Lên ca (上班)":
+        response = await handle_start_shift(update, context, user_state)
+    elif message_text == "🏁 Xuống ca (下班)":
+        response = await handle_end_shift(update, context, user_state)
+    elif message_text in ["🍚 Ăn cơm (吃饭)", "🚬 Hút thuốc (抽烟)", "🚻 Vệ sinh (厕所)"]:
+        response = await handle_break_start(update, context, user_state, message_text)
+    elif message_text == "💺 Trở lại chỗ ngồi (返回)":
+        response = await handle_break_end(update, context, user_state)
+        response += f"\n✅ {user_state.user_name} đã Trở lại chỗ ngồi (返回)."
+    else:
+        response = "Vui lòng chọn một hành động từ bàn phím."
+    
+    if response:
+        await update.message.reply_text(response, reply_markup=get_keyboard())
+
+async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Running periodic check")
+    now = datetime.now(VN_TIMEZONE)
+    for hashed_user_id, user_state in user_states.items():
+        if user_state.is_working and user_state.current_break:
+            break_duration = now - user_state.break_start_time
+            if break_duration > timedelta(minutes=BREAK_DURATIONS[user_state.current_break]):
+                logger.warning(f"{user_state.user_name} is on an extended {user_state.current_break} break")
+                overtime = break_duration - timedelta(minutes=BREAK_DURATIONS[user_state.current_break])
+                try:
+                    await notify_admin(context, f"⚠️ {user_state.user_name} đang trong giờ nghỉ {user_state.current_break} quá {overtime}.")
+                except Exception as e:
+                    logger.error(f"Lỗi khi gửi thông báo cho admin: {str(e)}")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception while handling an update: {context.error}")
+    if isinstance(context.error, (Forbidden, BadRequest)):
+        logger.warning(f"Telegram API error: {str(context.error)}")
+    else:
+        # Xử lý các loại lỗi khác ở đây
+        pass
+
+def init_db():
+    conn = sqlite3.connect('user_states.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS user_states
+                 (hashed_user_id TEXT PRIMARY KEY, user_data TEXT)''')
+    conn.commit()
+    conn.close()
+
+def save_user_state(hashed_user_id: str, user_state: UserState):
+    logger.debug(f"Lưu trạng thái cho user {user_state.user_name}")
+    conn = sqlite3.connect('user_states.db')
+    c = conn.cursor()
+    user_data = {
+        'user_name': user_state.user_name,
+        'start_time': user_state.start_time.isoformat() if user_state.start_time else None,
+        'end_time': user_state.end_time.isoformat() if user_state.end_time else None,
+        'current_break': user_state.current_break,
+        'break_start_time': user_state.break_start_time.isoformat() if user_state.break_start_time else None,
+        'is_working': user_state.is_working
+    }
+    c.execute("INSERT OR REPLACE INTO user_states (hashed_user_id, user_data) VALUES (?, ?)",
+              (hashed_user_id, json.dumps(user_data)))
+    conn.commit()
+    conn.close()
+
+def load_user_states():
+    logger.info("Đang tải trạng thái của tất cả người dùng")
+    conn = sqlite3.connect('user_states.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM user_states")
+    rows = c.fetchall()
+    conn.close()
+
+    loaded_states = {}
+    for row in rows:
+        hashed_user_id, user_data_json = row
+        user_data = json.loads(user_data_json)
+        user_state = UserState(user_name=user_data['user_name'])
+        user_state.start_time = datetime.fromisoformat(user_data['start_time']) if user_data.get('start_time') else None
+        user_state.current_break = user_data.get('current_break')
+        user_state.break_start_time = datetime.fromisoformat(user_data['break_start_time']) if user_data.get('break_start_time') else None
+        user_state.is_working = user_data.get('is_working', False)
+        user_state.end_time = datetime.fromisoformat(user_data['end_time']) if user_data.get('end_time') else None
+        loaded_states[hashed_user_id] = user_state
+    logger.info(f"Đã tải {len(loaded_states)} trạng thái người dùng")
+    return loaded_states
+
+async def save_all_user_states(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Saving all user states")
+    for hashed_user_id, user_state in user_states.items():
+        save_user_state(hashed_user_id, user_state)
+    logger.info("All user states saved successfully")
+
+async def reset_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != MAIN_ADMIN_ID:
+        await update.message.reply_text("Bạn không có quyền thực hiện hành động này.")
+        return
+
+    global user_states
+    user_states = {}
+    
+    # Xóa dữ liệu trong database
+    conn = sqlite3.connect('user_states.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM user_states")
+    conn.commit()
+    conn.close()
+
+    logger.info("Đã reset toàn bộ dữ liệu")
+    await update.message.reply_text("Đã reset toàn bộ dữ liệu thành công.")
+    await notify_admin(context, "🔄 Toàn bộ dữ liệu đã được reset.")
+
+async def all_start_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != MAIN_ADMIN_ID:
+        await update.message.reply_text("Bạn không có quyền thực hiện hành động này.")
+        return
+
+    now = datetime.now(VN_TIMEZONE)
+    for hashed_user_id, user_state in user_states.items():
+        if not user_state.is_working:
+            user_state.start_time = now
+            user_state.is_working = True
+            save_user_state(hashed_user_id, user_state)
+    
+    logger.info("Đã bắt đầu ca làm việc cho tất cả người dùng")
+    await update.message.reply_text("Đã bắt đầu ca làm việc cho tất cả người dùng.")
+    await notify_admin(context, "🚀 Đã bắt đầu ca làm việc cho tất cả người dùng.")
+
+async def all_end_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != MAIN_ADMIN_ID:
+        await update.message.reply_text("Bạn không có quyền thực hiện hành động này.")
+        return
+
+    now = datetime.now(VN_TIMEZONE)
+    for hashed_user_id, user_state in user_states.items():
+        if user_state.is_working:
+            user_state.end_time = now
+            user_state.is_working = False
+            if user_state.current_break:
+                user_state.breaks[user_state.current_break] += now - user_state.break_start_time
+                user_state.current_break = None
+                user_state.break_start_time = None
+            save_user_state(hashed_user_id, user_state)
+    
+    logger.info("Đã kết thúc ca làm việc cho tất cả người dùng")
+    await update.message.reply_text("Đã kết thúc ca làm việc cho tất cả người dùng.")
+    await notify_admin(context, "🏁 Đã kết thúc ca làm việc cho tất cả người dùng.")
+
+async def all_eat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != MAIN_ADMIN_ID:
+        await update.message.reply_text("Bạn không có quyền thực hiện hành động này.")
+        return
+
+    now = datetime.now(VN_TIMEZONE)
+    for hashed_user_id, user_state in user_states.items():
+        if user_state.is_working and not user_state.current_break:
+            user_state.current_break = '🍚 Ăn cơm (吃饭)'
+            user_state.break_start_time = now
+            user_state.break_counts['🍚 Ăn cơm (吃饭)'] += 1
+            save_user_state(hashed_user_id, user_state)
+    
+    logger.info("Đã bắt đầu giờ ăn cho tất cả người dùng đang làm việc")
+    await update.message.reply_text("Đã bắt đầu giờ ăn cho tất cả người dùng đang làm việc.")
+    await notify_admin(context, "🍚 Đã bắt đầu giờ ăn cho tất cả người dùng đang làm việc.")
+
+async def auto_end_shift(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(VN_TIMEZONE)
+    for hashed_user_id, user_state in user_states.items():
+        if user_state.is_working:
+            user_state.end_time = now
+            user_state.is_working = False
+            if user_state.current_break:
+                user_state.breaks[user_state.current_break] += now - user_state.break_start_time
+                user_state.current_break = None
+                user_state.break_start_time = None
+            
+            report = generate_simple_report(user_state, hashed_user_id)
+            save_user_state(hashed_user_id, user_state)
+            
+            try:
+                await context.bot.send_message(chat_id=int(hashed_user_id, 16), text=report)
+            except Exception as e:
+                logger.error(f"Không thể gửi báo cáo cho user {user_state.user_name}: {str(e)}")
+
+async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(VN_TIMEZONE)
+    yesterday = now - timedelta(days=1)
+    report = f"📊 Báo cáo cuối ngày {yesterday.strftime('%d/%m/%Y')}:\n\n"
+
+    user_reports = []
+    for hashed_user_id, user_state in user_states.items():
+        if user_state.start_time and user_state.start_time.date() == yesterday.date():
+            user_report = generate_simple_report(user_state, hashed_user_id)
+            if user_report:
+                user_reports.append(user_report)
+
+    if user_reports:
+        report += "\n".join(user_reports)
+    else:
+        report += "Không có dữ liệu báo cáo cho ngày hôm qua."
+
+    await notify_admin(context, report, notify_all=True)
+
+    # Reset user states for the new day
+    for user_state in user_states.values():
+        user_state.start_time = None
+        user_state.end_time = None
+    user_state.breaks = {k: timedelta(0) for k in BREAK_DURATIONS.keys()}
+    user_state.current_break = None
+    user_state.break_start_time = None
+    user_state.is_working = False
+    user_state.break_counts = {k: 0 for k in BREAK_DURATIONS.keys()}
+
+def main():
+    init_db()
+    global user_states
+    user_states = load_user_states()
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    job_queue = application.job_queue
+    job_queue.run_repeating(periodic_check, interval=timedelta(minutes=15), first=10)
+    job_queue.run_repeating(save_all_user_states, interval=timedelta(minutes=5), first=5)
+    
+    # Thêm job để tự động kết thúc ca làm việc lúc 1:00 AM
+    job_queue.run_daily(auto_end_shift, time=time(hour=1, minute=0))
+    
+    # Cập nhật job gửi báo cáo hàng ngày để chạy lúc 1:05 AM
+    job_queue.run_daily(send_daily_report, time=time(hour=1, minute=5))
+
+    application.add_error_handler(error_handler)
+
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()

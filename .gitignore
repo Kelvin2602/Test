@@ -1,0 +1,26 @@
+# Virtual Environment
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Database
+data/*.db
+data/*.db-journal
+
+# Config
+config/encryption_key.key
+.env
+.env.*
+
+# Backup
+backup/
+.DS_Store
